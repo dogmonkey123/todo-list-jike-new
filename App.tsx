@@ -11,6 +11,8 @@ import {
 } from 'react-native';
 import { StatusBar } from 'expo-status-bar';
 import { Ionicons } from '@expo/vector-icons';
+// native date/time picker
+import DateTimePicker from '@react-native-community/datetimepicker';
 // @ts-ignore 模块由 Expo 提供，运行时可用
 import * as Notifications from 'expo-notifications';
 import styles from './styles';
@@ -27,7 +29,8 @@ type Todo = {
   mode: TodoMode;
   category?: TodoCategory;
   deadline?: number; // timestamp
-  reminderOffsetMinutes?: number;
+  // absolute reminder time (timestamp)
+  reminderAt?: number;
   notificationId?: string;
 };
 
@@ -37,8 +40,25 @@ export default function App() {
   const [filter, setFilter] = useState<TodoFilter>('all');
   const [mode, setMode] = useState<TodoMode>('simple');
   const [category, setCategory] = useState<TodoCategory>('work');
-  const [deadlineText, setDeadlineText] = useState('');
-  const [reminderOffsetText, setReminderOffsetText] = useState('');
+  // use Date objects and native pickers for template mode
+  const [deadlineDate, setDeadlineDate] = useState<Date | undefined>(undefined);
+  const [showDeadlineDatePicker, setShowDeadlineDatePicker] = useState(false);
+  const [showDeadlineTimePicker, setShowDeadlineTimePicker] = useState(false);
+
+  const [reminderAt, setReminderAt] = useState<Date | undefined>(undefined);
+  const [showReminderPicker, setShowReminderPicker] = useState(false);
+  const [editingTodoId, setEditingTodoId] = useState<string | undefined>(undefined);
+  const [editTitle, setEditTitle] = useState('');
+  const [editCategory, setEditCategory] = useState<TodoCategory>('work');
+  const [editDeadlineDate, setEditDeadlineDate] = useState<Date | undefined>(undefined);
+  const [editReminderAt, setEditReminderAt] = useState<Date | undefined>(undefined);
+  const [showEditDeadlinePicker, setShowEditDeadlinePicker] = useState(false);
+  const [showEditReminderPicker, setShowEditReminderPicker] = useState(false);
+
+  // helpers to format date/time for display
+  const formatDate = (d?: Date) => (d ? d.toLocaleDateString() : '未设置');
+  const formatTime = (d?: Date) =>
+    d ? d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : '未设置';
 
   useEffect(() => {
     Notifications.setNotificationHandler({
@@ -74,36 +94,37 @@ export default function App() {
     const title = input.trim();
     if (!title) return;
     let deadline: number | undefined;
-    let reminderOffsetMinutes: number | undefined;
+    let reminderTimestamp: number | undefined;
     let notificationId: string | undefined;
 
     if (mode === 'template') {
-      if (deadlineText) {
-        const parsed = Date.parse(deadlineText);
-        if (!Number.isNaN(parsed)) {
-          deadline = parsed;
-        }
-      }
-      const offset = parseInt(reminderOffsetText, 10);
-      if (!Number.isNaN(offset) && offset > 0) {
-        reminderOffsetMinutes = offset;
+      if (deadlineDate) {
+        deadline = deadlineDate.getTime();
       }
 
-      if (deadline && reminderOffsetMinutes) {
-        const triggerTime = deadline - reminderOffsetMinutes * 60 * 1000;
-        if (triggerTime > Date.now()) {
-          const triggerDate = new Date(triggerTime);
-          const res = await Notifications.scheduleNotificationAsync({
-            content: {
-              title: '待办提醒',
-              body: title,
-            },
-            // 类型定义里没有 Date 触发器，这里直接按运行时支持的写法并断言
-            trigger: triggerDate as any,
-          });
-          notificationId = res;
-        }
+      if (reminderAt) {
+        reminderTimestamp = reminderAt.getTime();
       }
+
+      // schedule using absolute reminder timestamp (if set)
+      if (reminderTimestamp && reminderTimestamp > Date.now()) {
+        const triggerDate = new Date(reminderTimestamp);
+        const res = await Notifications.scheduleNotificationAsync({
+          content: {
+            title: '待办提醒',
+            body: title,
+          },
+          trigger: triggerDate as any,
+        });
+        notificationId = res;
+      }
+      if (mode === 'template') {
+        setDeadlineDate(undefined);
+        setReminderAt(undefined);
+      }
+      // 添加后回到简单模式并显示全部
+      setMode('simple');
+      setFilter('all');
     }
 
     const newTodo: Todo = {
@@ -114,14 +135,14 @@ export default function App() {
       mode,
       category: mode === 'template' ? category : undefined,
       deadline,
-      reminderOffsetMinutes,
+      reminderAt: reminderTimestamp,
       notificationId,
     };
     setTodos((prev) => [newTodo, ...prev]);
     setInput('');
     if (mode === 'template') {
-      setDeadlineText('');
-      setReminderOffsetText('');
+      setDeadlineDate(undefined);
+      setReminderAt(undefined);
     }
   };
 
@@ -151,8 +172,15 @@ export default function App() {
   const clearCompleted = () => {
     setTodos((prev) => prev.filter((t) => !t.completed));
   };
-
   const renderTodoItemContent = (item: Todo) => {
+    // const catColor = item.category === 'work' ? '#ff6b6b' : item.category === 'study' ? '#1e90ff' : '#2ecc71';
+    const catColor = item.category
+  ? item.category === 'work'
+    ? '#ff6b6b'
+    : item.category === 'study'
+    ? '#1e90ff'
+    : '#2ecc71'
+  : '#c0c4cc';
     return (
       <View style={styles.todoItem}>
         <TouchableOpacity
@@ -166,15 +194,37 @@ export default function App() {
             <Ionicons name="checkmark" size={16} color="#fff" />
           )}
         </TouchableOpacity>
-        <Text
-          style={[
-            styles.todoText,
-            item.completed && styles.todoTextCompleted,
-          ]}
-          numberOfLines={2}
+
+        <TouchableOpacity
+          style={{ flex: 1, paddingHorizontal: 8 }}
+          onPress={() => {
+            // open editor for this todo
+            setEditingTodoId(item.id);
+            setEditTitle(item.title);
+            setEditCategory(item.category || 'work');
+            setEditDeadlineDate(item.deadline ? new Date(item.deadline) : undefined);
+            setEditReminderAt(item.reminderAt ? new Date(item.reminderAt) : undefined);
+          }}
         >
-          {item.title}
-        </Text>
+          <View style={{ flexDirection: 'row', alignItems: 'center' }}>
+            <View style={{ width: 8, height: 8, borderRadius: 4, backgroundColor: catColor, marginRight: 8 }} />
+            <Text
+              style={[
+                styles.todoText,
+                item.completed && styles.todoTextCompleted,
+              ]}
+              numberOfLines={2}
+            >
+              {item.title}
+            </Text>
+          </View>
+          {item.mode === 'template' && item.deadline && (
+            <Text style={{ color: '#666', fontSize: 12, marginTop: 4 }}>
+              截止：{new Date(item.deadline).toLocaleString()}
+            </Text>
+          )}
+        </TouchableOpacity>
+
         <TouchableOpacity
           style={styles.deleteButton}
           onPress={() => deleteTodo(item.id)}
@@ -184,6 +234,40 @@ export default function App() {
       </View>
     );
   };
+
+  const saveEdit = async () => {
+  if (!editingTodoId) return;
+  const id = editingTodoId;
+  const target = todos.find((t) => t.id === id);
+  if (target?.notificationId) {
+    await Notifications.cancelScheduledNotificationAsync(target.notificationId);
+  }
+  let newNotificationId: string | undefined;
+  if (editReminderAt && editReminderAt.getTime() > Date.now()) {
+    const res = await Notifications.scheduleNotificationAsync({
+      content: { title: '待办提醒', body: editTitle },
+      trigger: editReminderAt as any,
+    });
+    newNotificationId = res;
+  }
+  setTodos((prev) =>
+    prev.map((t) =>
+      t.id === id
+        ? {
+            ...t,
+            title: editTitle,
+            category: editCategory,
+            deadline: editDeadlineDate ? editDeadlineDate.getTime() : undefined,
+            reminderAt: editReminderAt ? editReminderAt.getTime() : undefined,
+            notificationId: newNotificationId,
+          }
+        : t,
+    ),
+  );
+  setEditingTodoId(undefined);
+};
+
+const cancelEdit = () => setEditingTodoId(undefined);
 
   return (
     <SafeAreaView style={styles.safeArea}>
@@ -211,7 +295,7 @@ export default function App() {
               placeholderTextColor="#aaa"
               value={input}
               onChangeText={setInput}
-              onSubmitEditing={handleAdd}
+              onSubmitEditing={mode === 'simple' ? handleAdd : undefined} // 键盘「完成」直接创建（只在简单模式响应 Enter）
               returnKeyType="done"
             />
           </View>
@@ -224,7 +308,7 @@ export default function App() {
             disabled={!input.trim()}
           >
             <Text style={styles.addButtonText}>
-              {mode === 'simple' ? '添加' : '添加模板'}
+              {mode === 'simple' ? '添加' : '添加'}
             </Text>
           </TouchableOpacity>
         </View>
@@ -244,26 +328,135 @@ export default function App() {
                 <CategoryTag label="生活" value="life" current={category} onPress={setCategory} />
               </View>
             </View>
+            {/* Deadline: date + time pickers (native) */}
             <View style={styles.templateSection}>
-              <Text style={styles.templateLabel}>截止时间（例如 2025-12-04 21:30）</Text>
-              <TextInput
+              <Text style={styles.templateLabel}>截止日期</Text>
+              <TouchableOpacity
                 style={styles.templateInput}
-                value={deadlineText}
-                placeholder="输入截止日期时间"
-                placeholderTextColor="#aaa"
-                onChangeText={setDeadlineText}
-              />
+                onPress={() => setShowDeadlineDatePicker((s) => !s)}
+              >
+                <Text>{formatDate(deadlineDate)}</Text>
+              </TouchableOpacity>
+              {showDeadlineDatePicker && (
+                <DateTimePicker
+                  value={deadlineDate || new Date()}
+                  mode="date"
+                  display={Platform.OS === 'ios' ? 'inline' : 'default'}
+                  onChange={(_, selected) => {
+                    if (Platform.OS === 'android') setShowDeadlineDatePicker(false);
+                    if (selected) {
+                      const old = deadlineDate || new Date();
+                      // keep time component if present
+                      const merged = new Date(
+                        selected.getFullYear(),
+                        selected.getMonth(),
+                        selected.getDate(),
+                        old.getHours(),
+                        old.getMinutes(),
+                      );
+                      setDeadlineDate(merged);
+                    }
+                  }}
+                />
+              )}
+
+              <TouchableOpacity
+                style={[styles.templateInput, { marginTop: 8 }]}
+                onPress={() => setShowDeadlineTimePicker((s) => !s)}
+              >
+                <Text>时间：{formatTime(deadlineDate)}</Text>
+              </TouchableOpacity>
+              {showDeadlineTimePicker && (
+                <DateTimePicker
+                  value={deadlineDate || new Date()}
+                  mode="time"
+                  display="spinner"
+                  onChange={(_, selected) => {
+                    if (Platform.OS === 'android') setShowDeadlineTimePicker(false);
+                    if (selected) {
+                      const old = deadlineDate || new Date();
+                      const merged = new Date(
+                        old.getFullYear(),
+                        old.getMonth(),
+                        old.getDate(),
+                        selected.getHours(),
+                        selected.getMinutes(),
+                      );
+                      setDeadlineDate(merged);
+                    }
+                  }}
+                />
+              )}
             </View>
+
+            {/* Reminder datetime picker (native), click to expand/collapse */}
             <View style={styles.templateSection}>
-              <Text style={styles.templateLabel}>提醒时间（单位：分钟，如 5 或 60）</Text>
-              <TextInput
+              <Text style={styles.templateLabel}>提醒时间</Text>
+              <TouchableOpacity
                 style={styles.templateInput}
-                value={reminderOffsetText}
-                placeholder="截止前多少分钟提醒"
-                placeholderTextColor="#aaa"
-                keyboardType="numeric"
-                onChangeText={setReminderOffsetText}
-              />
+                onPress={() => setShowReminderPicker((s) => !s)}
+              >
+                <Text>
+                  {reminderAt ? `${formatDate(reminderAt)} ${formatTime(reminderAt)}` : '未设置'}
+                </Text>
+              </TouchableOpacity>
+              {showReminderPicker && (
+                <DateTimePicker
+                  value={reminderAt || new Date()}
+                  mode="datetime"
+                  display={Platform.OS === 'ios' ? 'inline' : 'default'}
+                  onChange={(_, selected) => {
+                    if (Platform.OS === 'android') setShowReminderPicker(false);
+                    if (selected) setReminderAt(selected);
+                  }}
+                />
+              )}
+            </View>
+          </View>
+        )}
+
+
+        {editingTodoId && (
+          <View style={[styles.templatePanel, { borderColor: '#ddd', marginBottom: 12 }]}>
+            <Text style={styles.templateLabel}>编辑待办</Text>
+            <TextInput style={styles.templateInput} value={editTitle} onChangeText={setEditTitle} />
+            <View style={{ flexDirection: 'row', marginTop: 8 }}>
+              <CategoryTag label="工作" value="work" current={editCategory} onPress={setEditCategory} />
+              <CategoryTag label="学习" value="study" current={editCategory} onPress={setEditCategory} />
+              <CategoryTag label="生活" value="life" current={editCategory} onPress={setEditCategory} />
+            </View>
+
+            <View style={{ marginTop: 8 }}>
+              <TouchableOpacity style={styles.templateInput} onPress={() => setShowEditDeadlinePicker(s => !s)}>
+                <Text>截止：{formatDate(editDeadlineDate)} {formatTime(editDeadlineDate)}</Text>
+              </TouchableOpacity>
+              {showEditDeadlinePicker && (
+                <DateTimePicker
+                  value={editDeadlineDate || new Date()}
+                  mode="datetime"
+                  display={Platform.OS === 'ios' ? 'inline' : 'default'}
+                  onChange={(_, s) => { if (Platform.OS === 'android') setShowEditDeadlinePicker(false); if (s) setEditDeadlineDate(s); }}
+                />
+              )}
+            </View>
+
+            <View style={{ marginTop: 8 }}>
+              <TouchableOpacity style={styles.templateInput} onPress={() => setShowEditReminderPicker(s => !s)}>
+                <Text>提醒：{editReminderAt ? `${formatDate(editReminderAt)} ${formatTime(editReminderAt)}` : '未设置'}</Text>
+              </TouchableOpacity>
+              {showEditReminderPicker && (
+                <DateTimePicker
+                  value={editReminderAt || new Date()}
+                  mode="datetime"
+                  display={Platform.OS === 'ios' ? 'inline' : 'default'}
+                  onChange={(_, s) => { if (Platform.OS === 'android') setShowEditReminderPicker(false); if (s) setEditReminderAt(s); }}
+                />
+              )}
+            </View>
+
+            <View style={{ flexDirection: 'row', justifyContent: 'flex-end', marginTop: 10 }}>
+              <TouchableOpacity onPress={cancelEdit} style={{ marginRight: 12 }}><Text>取消</Text></TouchableOpacity>
+              <TouchableOpacity onPress={saveEdit}><Text style={{ color: '#1e90ff' }}>保存</Text></TouchableOpacity>
             </View>
           </View>
         )}
@@ -400,9 +593,10 @@ function CategoryTag({
   onPress,
 }: CategoryTagProps) {
   const active = value === current;
+  const color = value === 'work' ? '#ff6b6b' : value === 'study' ? '#1e90ff' : '#2ecc71';
   return (
     <TouchableOpacity
-      style={[styles.categoryTag, active && styles.categoryTagActive]}
+      style={[styles.categoryTag, active && styles.categoryTagActive, { borderColor: color }]}
       onPress={() => onPress(value)}
     >
       <Text
@@ -416,5 +610,6 @@ function CategoryTag({
     </TouchableOpacity>
   );
 }
+
 
 
