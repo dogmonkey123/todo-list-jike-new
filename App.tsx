@@ -19,6 +19,8 @@ import * as chrono from 'chrono-node';
 // @ts-ignore 模块由 Expo 提供，运行时可用
 import * as Notifications from 'expo-notifications';
 import styles from './styles';
+import useRecording from './src/hooks/useRecording';
+import DateTimeRow from './src/components/DateTimeRow';
 
 type TodoFilter = 'all' | 'active' | 'completed';
 type TodoMode = 'simple' | 'template';
@@ -55,19 +57,92 @@ export default function App() {
   const [editCategory, setEditCategory] = useState<TodoCategory>('work');
   const [editDeadlineDate, setEditDeadlineDate] = useState<Date | undefined>(undefined);
   const [editReminderAt, setEditReminderAt] = useState<Date | undefined>(undefined);
-  const [showEditDeadlinePicker, setShowEditDeadlinePicker] = useState(false);
-  const [showEditReminderPicker, setShowEditReminderPicker] = useState(false);
-  // voice states for speech-to-text flow
+  // native voice states (for @react-native-voice fallback/dev-client)
   const [listening, setListening] = useState(false);
-  const [voiceText, setVoiceText] = useState(''); // live interim result
+  const [voiceText, setVoiceText] = useState(''); // live interim result from native Voice
   const [pendingVoiceText, setPendingVoiceText] = useState<string | undefined>(undefined); // recognized text awaiting confirmation
+  // split edit deadline pickers into separate date/time toggles
+  const [showEditDeadlineDatePicker, setShowEditDeadlineDatePicker] = useState(false);
+  const [showEditDeadlineTimePicker, setShowEditDeadlineTimePicker] = useState(false);
+  const [showEditReminderPicker, setShowEditReminderPicker] = useState(false);
+  // refs to detect previous deadlines for relative reminder updates
+  const prevDeadlineRef = React.useRef<number | undefined>(undefined);
+  const prevEditDeadlineRef = React.useRef<number | undefined>(undefined);
+  const FIVE_MIN = 5 * 60 * 1000;
 
-  // Expo recording states for cloud STT fallback
-  const [recording, setRecording] = useState<any>(null);
-  const [isRecording, setIsRecording] = useState(false);
-  const [isUploading, setIsUploading] = useState(false);
-  // TODO: set to your backend endpoint that proxies to Google Speech-to-Text
-  const STT_BACKEND_URL = 'https://your-server.example.com/api/stt/google';
+  // STT backend config for useRecording hook — replace with your server/ngrok URL if needed
+  const STT_BACKEND_URL = 'http://10.0.2.2:3000/api/stt/google';
+  const STT_API_KEY: string | undefined = undefined;
+  const { isRecording, isUploading, startRecording, stopRecording } = useRecording(STT_BACKEND_URL, STT_API_KEY);
+
+  // When entering template mode, initialize defaults
+  useEffect(() => {
+    if (mode === 'template') {
+      if (!deadlineDate) {
+        const now = new Date();
+        setDeadlineDate(now);
+        prevDeadlineRef.current = now.getTime();
+      }
+      if (!reminderAt) {
+        const base = (deadlineDate && deadlineDate.getTime()) || Date.now();
+        setReminderAt(new Date(base - FIVE_MIN));
+      }
+      // ensure pickers are collapsed by default
+      setShowDeadlineDatePicker(false);
+      setShowDeadlineTimePicker(false);
+      setShowReminderPicker(false);
+    }
+  }, [mode]);
+
+  // Keep reminder relative to deadline if it was previously set as deadline - 5min
+  useEffect(() => {
+    const prev = prevDeadlineRef.current;
+    if (!deadlineDate) {
+      prevDeadlineRef.current = undefined;
+      return;
+    }
+    const newTs = deadlineDate.getTime();
+    const remTs = reminderAt ? reminderAt.getTime() : undefined;
+    if (prev === undefined && remTs === undefined) {
+      // both were unset previously; set reminder to new deadline -5min
+      setReminderAt(new Date(newTs - FIVE_MIN));
+    } else if (prev !== undefined && remTs !== undefined) {
+      // if reminder was exactly prev - 5min (within 1s), shift it along
+      if (Math.abs(remTs - (prev - FIVE_MIN)) < 1000) {
+        setReminderAt(new Date(newTs - FIVE_MIN));
+      }
+    }
+    prevDeadlineRef.current = newTs;
+  }, [deadlineDate]);
+
+  // For edit panel, keep similar behaviour when editing a todo
+  useEffect(() => {
+    if (editingTodoId) {
+      // ensure edit pickers collapsed by default
+      setShowEditDeadlineDatePicker(false);
+      setShowEditDeadlineTimePicker(false);
+      setShowEditReminderPicker(false);
+      prevEditDeadlineRef.current = editDeadlineDate ? editDeadlineDate.getTime() : undefined;
+    }
+  }, [editingTodoId]);
+
+  useEffect(() => {
+    const prev = prevEditDeadlineRef.current;
+    if (!editDeadlineDate) {
+      prevEditDeadlineRef.current = undefined;
+      return;
+    }
+    const newTs = editDeadlineDate.getTime();
+    const remTs = editReminderAt ? editReminderAt.getTime() : undefined;
+    if (prev === undefined && remTs === undefined) {
+      setEditReminderAt(new Date(newTs - FIVE_MIN));
+    } else if (prev !== undefined && remTs !== undefined) {
+      if (Math.abs(remTs - (prev - FIVE_MIN)) < 1000) {
+        setEditReminderAt(new Date(newTs - FIVE_MIN));
+      }
+    }
+    prevEditDeadlineRef.current = newTs;
+  }, [editDeadlineDate]);
 
   // helpers to format date/time for display
   const formatDate = (d?: Date) => (d ? d.toLocaleDateString() : '未设置');
@@ -208,70 +283,6 @@ export default function App() {
     if (voiceText) {
       setPendingVoiceText(voiceText);
       setVoiceText('');
-    }
-  };
-
-  const startRecordingExpo = async () => {
-    try {
-      // dynamic require to avoid TypeScript / Expo Go static import issues
-      // eslint-disable-next-line @typescript-eslint/no-var-requires
-      const { Audio } = require('expo-av');
-      await Audio.setAudioModeAsync({ allowsRecordingIOS: true, playsInSilentModeIOS: true });
-      const rec = new Audio.Recording();
-      await rec.prepareToRecordAsync(Audio.RECORDING_OPTIONS_PRESET_HIGH_QUALITY);
-      await rec.startAsync();
-      setRecording(rec);
-      setIsRecording(true);
-    } catch (e) {
-      console.warn('startRecordingExpo err', e);
-      Alert.alert('录音失败', '无法开始录音，请检查麦克风权限');
-    }
-  };
-
-  const stopRecordingAndUploadExpo = async () => {
-    if (!recording) return;
-    setIsRecording(false);
-    try {
-      await recording.stopAndUnloadAsync();
-      const uri = recording.getURI();
-      setRecording(null);
-      if (!uri) {
-        Alert.alert('录音失败', '未获取到录音文件');
-        return;
-      }
-
-      setIsUploading(true);
-      // dynamic require for FileSystem and FormData handling
-      // eslint-disable-next-line @typescript-eslint/no-var-requires
-      const FileSystem = require('expo-file-system');
-      const fileInfo = await FileSystem.getInfoAsync(uri);
-      const fileName = uri.split('/').pop() || 'recording.m4a';
-      const formData = new FormData();
-      // @ts-ignore - RN FormData file
-      formData.append('file', {
-        uri,
-        name: fileName,
-        type: 'audio/m4a',
-      });
-
-      const res = await fetch(STT_BACKEND_URL, {
-        method: 'POST',
-        body: formData,
-      });
-
-      if (!res.ok) {
-        const txt = await res.text();
-        throw new Error(txt || '服务器返回错误');
-      }
-      const data = await res.json();
-      const text = data?.text ?? '';
-      if (text) setPendingVoiceText(text);
-      else Alert.alert('识别结果为空', '未识别到语音文本');
-    } catch (err) {
-      console.warn('upload stt err', err);
-      Alert.alert('识别失败', '上传或识别出错，请重试');
-    } finally {
-      setIsUploading(false);
     }
   };
 
@@ -472,8 +483,17 @@ const cancelEdit = () => setEditingTodoId(undefined);
             />
             {/* 按住录音：Expo Go 可用（会上传到后端做 Google STT） */}
             <TouchableOpacity
-              onPressIn={() => startRecordingExpo()}
-              onPressOut={() => stopRecordingAndUploadExpo()}
+              onPressIn={async () => {
+                try { await startRecording(); } catch (e) { Alert.alert('录音失败', '无法开始录音'); }
+              }}
+              onPressOut={async () => {
+                try {
+                  const text = await stopRecording();
+                  if (text) setPendingVoiceText(text);
+                } catch (e) {
+                  Alert.alert('识别失败', '上传或识别出错，请重试');
+                }
+              }}
               style={{ marginLeft: 8 }}
             >
               <Ionicons
@@ -482,6 +502,7 @@ const cancelEdit = () => setEditingTodoId(undefined);
                 color={isRecording ? '#e53935' : '#666'}
               />
             </TouchableOpacity>
+            {isUploading && <Text style={{ marginLeft: 8, color: '#666' }}>上传中...</Text>}
           </View>
           <TouchableOpacity
             style={[
@@ -512,89 +533,13 @@ const cancelEdit = () => setEditingTodoId(undefined);
                 <CategoryTag label="生活" value="life" current={category} onPress={setCategory} />
               </View>
             </View>
-            {/* Deadline: date + time pickers (native) */}
             <View style={styles.templateSection}>
               <Text style={styles.templateLabel}>截止日期</Text>
-              <TouchableOpacity
-                style={styles.templateInput}
-                onPress={() => setShowDeadlineDatePicker((s) => !s)}
-              >
-                <Text>{formatDate(deadlineDate)}</Text>
-              </TouchableOpacity>
-              {showDeadlineDatePicker && (
-                <DateTimePicker
-                  value={deadlineDate || new Date()}
-                  mode="date"
-                  display={Platform.OS === 'ios' ? 'inline' : 'default'}
-                  onChange={(_, selected) => {
-                    if (Platform.OS === 'android') setShowDeadlineDatePicker(false);
-                    if (selected) {
-                      const old = deadlineDate || new Date();
-                      // keep time component if present
-                      const merged = new Date(
-                        selected.getFullYear(),
-                        selected.getMonth(),
-                        selected.getDate(),
-                        old.getHours(),
-                        old.getMinutes(),
-                      );
-                      setDeadlineDate(merged);
-                    }
-                  }}
-                />
-              )}
-
-              <TouchableOpacity
-                style={[styles.templateInput, { marginTop: 8 }]}
-                onPress={() => setShowDeadlineTimePicker((s) => !s)}
-              >
-                <Text>时间：{formatTime(deadlineDate)}</Text>
-              </TouchableOpacity>
-              {showDeadlineTimePicker && (
-                <DateTimePicker
-                  value={deadlineDate || new Date()}
-                  mode="time"
-                  display="spinner"
-                  onChange={(_, selected) => {
-                    if (Platform.OS === 'android') setShowDeadlineTimePicker(false);
-                    if (selected) {
-                      const old = deadlineDate || new Date();
-                      const merged = new Date(
-                        old.getFullYear(),
-                        old.getMonth(),
-                        old.getDate(),
-                        selected.getHours(),
-                        selected.getMinutes(),
-                      );
-                      setDeadlineDate(merged);
-                    }
-                  }}
-                />
-              )}
+              <DateTimeRow label={undefined} value={deadlineDate} onChange={(d) => setDeadlineDate(d)} />
             </View>
-
-            {/* Reminder datetime picker (native), click to expand/collapse */}
             <View style={styles.templateSection}>
               <Text style={styles.templateLabel}>提醒时间</Text>
-              <TouchableOpacity
-                style={styles.templateInput}
-                onPress={() => setShowReminderPicker((s) => !s)}
-              >
-                <Text>
-                  {reminderAt ? `${formatDate(reminderAt)} ${formatTime(reminderAt)}` : '未设置'}
-                </Text>
-              </TouchableOpacity>
-              {showReminderPicker && (
-                <DateTimePicker
-                  value={reminderAt || new Date()}
-                  mode="datetime"
-                  display={Platform.OS === 'ios' ? 'inline' : 'default'}
-                  onChange={(_, selected) => {
-                    if (Platform.OS === 'android') setShowReminderPicker(false);
-                    if (selected) setReminderAt(selected);
-                  }}
-                />
-              )}
+              <DateTimeRow value={reminderAt} onChange={(d) => setReminderAt(d)} />
             </View>
           </View>
         )}
@@ -621,31 +566,11 @@ const cancelEdit = () => setEditingTodoId(undefined);
             </View>
 
             <View style={{ marginTop: 8 }}>
-              <TouchableOpacity style={styles.templateInput} onPress={() => setShowEditDeadlinePicker(s => !s)}>
-                <Text>截止：{formatDate(editDeadlineDate)} {formatTime(editDeadlineDate)}</Text>
-              </TouchableOpacity>
-              {showEditDeadlinePicker && (
-                <DateTimePicker
-                  value={editDeadlineDate || new Date()}
-                  mode="datetime"
-                  display={Platform.OS === 'ios' ? 'inline' : 'default'}
-                  onChange={(_, s) => { if (Platform.OS === 'android') setShowEditDeadlinePicker(false); if (s) setEditDeadlineDate(s); }}
-                />
-              )}
+              <DateTimeRow label="截止：" value={editDeadlineDate} onChange={(d) => setEditDeadlineDate(d)} />
             </View>
 
             <View style={{ marginTop: 8 }}>
-              <TouchableOpacity style={styles.templateInput} onPress={() => setShowEditReminderPicker(s => !s)}>
-                <Text>提醒：{editReminderAt ? `${formatDate(editReminderAt)} ${formatTime(editReminderAt)}` : '未设置'}</Text>
-              </TouchableOpacity>
-              {showEditReminderPicker && (
-                <DateTimePicker
-                  value={editReminderAt || new Date()}
-                  mode="datetime"
-                  display={Platform.OS === 'ios' ? 'inline' : 'default'}
-                  onChange={(_, s) => { if (Platform.OS === 'android') setShowEditReminderPicker(false); if (s) setEditReminderAt(s); }}
-                />
-              )}
+              <DateTimeRow label="提醒：" value={editReminderAt} onChange={(d) => setEditReminderAt(d)} />
             </View>
 
             <View style={{ flexDirection: 'row', justifyContent: 'flex-end', marginTop: 10 }}>
