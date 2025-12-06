@@ -8,11 +8,14 @@ import {
   KeyboardAvoidingView,
   Platform,
   FlatList,
+  Alert,
 } from 'react-native';
 import { StatusBar } from 'expo-status-bar';
 import { Ionicons } from '@expo/vector-icons';
 // native date/time picker
 import DateTimePicker from '@react-native-community/datetimepicker';
+// speech recognition will be required dynamically to avoid runtime crash in Expo Go
+import * as chrono from 'chrono-node';
 // @ts-ignore 模块由 Expo 提供，运行时可用
 import * as Notifications from 'expo-notifications';
 import styles from './styles';
@@ -54,6 +57,17 @@ export default function App() {
   const [editReminderAt, setEditReminderAt] = useState<Date | undefined>(undefined);
   const [showEditDeadlinePicker, setShowEditDeadlinePicker] = useState(false);
   const [showEditReminderPicker, setShowEditReminderPicker] = useState(false);
+  // voice states for speech-to-text flow
+  const [listening, setListening] = useState(false);
+  const [voiceText, setVoiceText] = useState(''); // live interim result
+  const [pendingVoiceText, setPendingVoiceText] = useState<string | undefined>(undefined); // recognized text awaiting confirmation
+
+  // Expo recording states for cloud STT fallback
+  const [recording, setRecording] = useState<any>(null);
+  const [isRecording, setIsRecording] = useState(false);
+  const [isUploading, setIsUploading] = useState(false);
+  // TODO: set to your backend endpoint that proxies to Google Speech-to-Text
+  const STT_BACKEND_URL = 'https://your-server.example.com/api/stt/google';
 
   // helpers to format date/time for display
   const formatDate = (d?: Date) => (d ? d.toLocaleDateString() : '未设置');
@@ -71,6 +85,19 @@ export default function App() {
 
     (async () => {
       await Notifications.requestPermissionsAsync();
+    })();
+
+    (async () => {
+      try {
+        // eslint-disable-next-line @typescript-eslint/no-var-requires
+        const { Audio } = require('expo-av');
+        const { status } = await Audio.requestPermissionsAsync();
+        if (status !== 'granted') {
+          Alert.alert('需要麦克风权限', '请在系统设置中允许麦克风权限以启用按住说话功能');
+        }
+      } catch (e) {
+        console.warn('request mic perm err', e);
+      }
     })();
   }, []);
 
@@ -145,6 +172,151 @@ export default function App() {
       setReminderAt(undefined);
     }
   };
+
+  // Voice helpers (dynamic require to avoid expo go crash)
+  const startListening = async () => {
+    try {
+      // eslint-disable-next-line @typescript-eslint/no-var-requires
+      const Voice = require('@react-native-voice/voice');
+      setVoiceText('');
+      setListening(true);
+      Voice.removeAllListeners?.();
+      Voice.onSpeechResults = (e: any) => {
+        const text = (e.value && e.value[0]) || '';
+        setVoiceText(text);
+      };
+      Voice.onSpeechEnd = () => setListening(false);
+      Voice.onSpeechError = () => setListening(false);
+      await Voice.start('zh-CN');
+    } catch (err) {
+      console.warn('voice start err', err);
+      Alert.alert('语音不可用', '当前环境不支持语音识别（Expo Go 不包含）。请使用开发构建或原生应用以启用语音功能。');
+      setListening(false);
+    }
+  };
+
+  const stopListening = async () => {
+    try {
+      // eslint-disable-next-line @typescript-eslint/no-var-requires
+      const Voice = require('@react-native-voice/voice');
+      await Voice.stop();
+      Voice.removeAllListeners?.();
+    } catch (err) {
+      console.warn('voice stop err', err);
+    }
+    setListening(false);
+    if (voiceText) {
+      setPendingVoiceText(voiceText);
+      setVoiceText('');
+    }
+  };
+
+  const startRecordingExpo = async () => {
+    try {
+      // dynamic require to avoid TypeScript / Expo Go static import issues
+      // eslint-disable-next-line @typescript-eslint/no-var-requires
+      const { Audio } = require('expo-av');
+      await Audio.setAudioModeAsync({ allowsRecordingIOS: true, playsInSilentModeIOS: true });
+      const rec = new Audio.Recording();
+      await rec.prepareToRecordAsync(Audio.RECORDING_OPTIONS_PRESET_HIGH_QUALITY);
+      await rec.startAsync();
+      setRecording(rec);
+      setIsRecording(true);
+    } catch (e) {
+      console.warn('startRecordingExpo err', e);
+      Alert.alert('录音失败', '无法开始录音，请检查麦克风权限');
+    }
+  };
+
+  const stopRecordingAndUploadExpo = async () => {
+    if (!recording) return;
+    setIsRecording(false);
+    try {
+      await recording.stopAndUnloadAsync();
+      const uri = recording.getURI();
+      setRecording(null);
+      if (!uri) {
+        Alert.alert('录音失败', '未获取到录音文件');
+        return;
+      }
+
+      setIsUploading(true);
+      // dynamic require for FileSystem and FormData handling
+      // eslint-disable-next-line @typescript-eslint/no-var-requires
+      const FileSystem = require('expo-file-system');
+      const fileInfo = await FileSystem.getInfoAsync(uri);
+      const fileName = uri.split('/').pop() || 'recording.m4a';
+      const formData = new FormData();
+      // @ts-ignore - RN FormData file
+      formData.append('file', {
+        uri,
+        name: fileName,
+        type: 'audio/m4a',
+      });
+
+      const res = await fetch(STT_BACKEND_URL, {
+        method: 'POST',
+        body: formData,
+      });
+
+      if (!res.ok) {
+        const txt = await res.text();
+        throw new Error(txt || '服务器返回错误');
+      }
+      const data = await res.json();
+      const text = data?.text ?? '';
+      if (text) setPendingVoiceText(text);
+      else Alert.alert('识别结果为空', '未识别到语音文本');
+    } catch (err) {
+      console.warn('upload stt err', err);
+      Alert.alert('识别失败', '上传或识别出错，请重试');
+    } finally {
+      setIsUploading(false);
+    }
+  };
+
+  const confirmVoiceCreate = async (text: string) => {
+    let deadlineTs: number | undefined;
+    let reminderTs: number | undefined;
+    try {
+      const results = (chrono as any).zh.parse(text || '');
+      if (results && results.length > 0) {
+        deadlineTs = results[0].start ? results[0].start.date().getTime() : undefined;
+        if (results[1] && results[1].start) reminderTs = results[1].start.date().getTime();
+      }
+    } catch (e) {
+      console.warn('chrono parse error', e);
+    }
+
+    const title = text.replace(/在|到|之前|之前提醒|提醒我|提醒|几号|几点|什么时候/g, '').trim() || '语音待办';
+
+    const newTodo: Todo = {
+      id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+      title,
+      completed: false,
+      createdAt: Date.now(),
+      mode: 'template',
+      category: 'work',
+      deadline: deadlineTs,
+      reminderAt: reminderTs,
+      notificationId: undefined,
+    };
+
+    if (reminderTs && reminderTs > Date.now()) {
+      const res = await Notifications.scheduleNotificationAsync({
+        content: { title: '待办提醒', body: newTodo.title },
+        trigger: new Date(reminderTs) as any,
+      });
+      newTodo.notificationId = res;
+    }
+
+    setTodos((prev) => [newTodo, ...prev]);
+    setPendingVoiceText(undefined);
+    setMode('simple');
+    setFilter('all');
+  };
+
+  const cancelVoice = () => setPendingVoiceText(undefined);
 
   const toggleTodo = (id: string) => {
     setTodos((prev) =>
@@ -298,6 +470,18 @@ const cancelEdit = () => setEditingTodoId(undefined);
               onSubmitEditing={mode === 'simple' ? handleAdd : undefined} // 键盘「完成」直接创建（只在简单模式响应 Enter）
               returnKeyType="done"
             />
+            {/* 按住录音：Expo Go 可用（会上传到后端做 Google STT） */}
+            <TouchableOpacity
+              onPressIn={() => startRecordingExpo()}
+              onPressOut={() => stopRecordingAndUploadExpo()}
+              style={{ marginLeft: 8 }}
+            >
+              <Ionicons
+                name={isRecording ? 'mic' : 'mic-outline'}
+                size={22}
+                color={isRecording ? '#e53935' : '#666'}
+              />
+            </TouchableOpacity>
           </View>
           <TouchableOpacity
             style={[
@@ -415,6 +599,16 @@ const cancelEdit = () => setEditingTodoId(undefined);
           </View>
         )}
 
+        {pendingVoiceText && (
+          <View style={[styles.templatePanel, { marginTop: 8 }]}> 
+            <Text style={styles.templateLabel}>识别到的文本</Text>
+            <Text style={{ marginTop: 6 }}>{pendingVoiceText}</Text>
+            <View style={{ flexDirection: 'row', justifyContent: 'flex-end', marginTop: 10 }}>
+              <TouchableOpacity onPress={cancelVoice} style={{ marginRight: 12 }}><Text>取消</Text></TouchableOpacity>
+              <TouchableOpacity onPress={() => confirmVoiceCreate(pendingVoiceText)}><Text style={{ color: '#1e90ff' }}>确认添加</Text></TouchableOpacity>
+            </View>
+          </View>
+        )}
 
         {editingTodoId && (
           <View style={[styles.templatePanel, { borderColor: '#ddd', marginBottom: 12 }]}>

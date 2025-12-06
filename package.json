@@ -11,6 +11,8 @@
   "dependencies": {
     "@expo/vector-icons": "^15.0.3",
     "@react-native-community/datetimepicker": "^8.4.4",
+    "@react-native-voice/voice": "^3.2.4",
+    "chrono-node": "^2.9.0",
     "expo": "~54.0.25",
     "expo-notifications": "^0.30.7",
     "expo-status-bar": "~3.0.8",
